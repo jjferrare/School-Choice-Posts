@@ -1,0 +1,227 @@
+---
+title: "School Choice Posts"
+author: "Joseph J Ferrare"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview and Objectives
+
+# Setup
+
+## Libraries
+```{r}
+library(tidyverse)
+library(stringr)
+library(rvest)
+library(tm)
+library(textcat)
+library(tidytext)
+library(topicmodels)
+library(lubridate)
+library(reshape2)
+```
+## Data
+```{r}
+# raw dataset retrieved via CrowdTangle on August 13, 2024 using historical search feature
+# and search term "#schoolchoice" from January 1, 2014 to August 13, 2024
+dat<- read_csv("hashtagschoolchoice2014_2024.csv")
+```
+
+## Data Preprocessing
+```{r}
+# Replace spaces with underscores in column names
+names(dat) <- gsub(" ", "_", names(dat))
+
+# extract urls from FB posts and create new variable
+dat$urls <- str_extract(dat$Message, "http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
+
+# fetch webpage content from urls. Note: this will take a very long time. 
+#extract_content <- function(url) {
+    #webpage <- tryCatch(read_html(url), error = function(e) NA)
+    #if (!is.na(webpage)) {
+     #   title <- webpage %>% html_node("title") %>% html_text()
+      #  description <- webpage %>% html_node("meta[name='description']") %>% html_attr("content")
+       # content <- webpage %>% html_nodes("p") %>% html_text() %>% paste(collapse = " ")
+        #return(list(title = title, description = description, content = content))
+  #  } else {
+   #     return(list(title = NA, description = NA, content = NA))
+  #  }
+#}
+
+# Convert text to lowercase
+dat$Message <- tolower(dat$Message)
+# filter cases where Page_Admin_Top_Country is US or missing/NA
+dat <- dat %>% filter(dat$Page_Admin_Top_Country %in% c("US", NA))
+# rename NA to "Unknown"
+dat$Page_Admin_Top_Country[is.na(dat$Page_Admin_Top_Country)] <- "Unknown"
+# convert Post_Created_Date to Date format
+dat$Post_Created_Date <- mdy(dat$Post_Created_Date)
+# create new variable year
+dat$year <- format(dat$Post_Created_Date, "%Y")
+
+# only use posts from 2019 thru 2021
+dat <- dat %>% filter(year %in% c("2019", "2020", "2021"))
+
+# Tokenize and clean the text data
+dat_clean <- dat %>%
+  unnest_tokens(word, Message) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% c("#schoolchoice", "schoolchoice", "school", "http", "https"))  # Remove irrelevant tokens
+```
+
+# Document-Term Matrix
+```{r}
+# Create a list of DTMs, one for each year 
+dtms <- list()
+
+for (year in unique(dat_clean$year)) {
+  slice <- dat_clean %>% filter(year == !!year)
+  
+  # Create a DTM
+  dtm <- slice %>%
+    count(document = row_number(), word) %>%
+    cast_dtm(document, word, n)
+  
+  dtms[[year]] <- dtm
+}
+
+```
+
+# Topic Modeling
+```{r}
+# Set the number of topics
+k <- 6  # You can adjust the number of topics
+
+# Store models for each time slice
+models <- list()
+
+for (year in names(dtms)) {
+  dtm <- dtms[[year]]
+  lda_model <- LDA(dtm, k = k, control = list(seed = 1234))
+  models[[year]] <- lda_model
+}
+
+```
+
+# Analysis of Topics over Time
+```{r}
+# Extract the top terms for each topic in each year
+top_terms <- list()
+
+for (year in names(models)) {
+  lda_model <- models[[year]]
+  
+  # Get top terms for each topic
+  top_terms[[year]] <- tidy(lda_model, matrix = "beta") %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup()
+}
+
+# Example: Compare top terms for a specific topic across years
+topic_to_track <- 1  # Replace with the topic number you're interested in
+
+for (year in names(top_terms)) {
+  cat("Top terms in year", year, "for topic", topic_to_track, ":\n")
+  print(top_terms[[year]] %>% filter(topic == topic_to_track))
+  cat("\n")
+}
+
+```
+
+# Perplexity
+```{r}
+# Define the range of topics you want to test
+topic_range <- seq(2, 10, by = 2)  
+
+# Initialize a vector to store perplexity values
+perplexity_values <- c()
+
+# Loop over the range of topics
+for (k in topic_range) {
+  # Train the LDA model
+  lda_model <- LDA(dtm, k = k, control = list(seed = 1234))
+  
+  # Calculate the perplexity for this model
+  perplexity_values <- c(perplexity_values, perplexity(lda_model, newdata = dtm))
+}
+
+# Create a data frame to store the number of topics and corresponding perplexity
+perplexity_df <- data.frame(
+  Topics = topic_range,
+  Perplexity = perplexity_values
+)
+
+# Plot using ggplot2
+ggplot(perplexity_df, aes(x = Topics, y = Perplexity)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  theme_minimal() +
+  labs(title = "Elbow Plot of Perplexity",
+       x = "Number of Topics",
+       y = "Perplexity")
+
+```
+
+
+# Visualization
+```{r}
+# Extract gamma (topic proportions) for each year
+gamma_values <- lapply(models, function(model) {
+  tidy(model, matrix = "gamma")
+})
+
+# Combine gamma values into a single data frame
+gamma_df <- bind_rows(gamma_values, .id = "year")
+
+# Plot the topic proportions over time
+library(ggplot2)
+
+ggplot(gamma_df, aes(x = as.integer(year), y = gamma, color = factor(topic))) +
+  geom_line() +
+  labs(title = "Topic Proportions Over Time", x = "Year", y = "Proportion") +
+  theme_minimal()
+
+```
+
+
+# Notes
+Some possible analyses to consider:
+1. Topic number by term MDS plot to see how topics are related to each other and to identify meta-topics
+2. create an actor/page name by topic matrix to see which actors/pages are associated with which topics
+3. create a topic by time matrix to see how topics change over time
+4. analyze url content for each topic and changes over time
+
+```{r}
+# Run test of URL extraction and content extraction on a subset of the data
+# filter the first 20 cases in dat
+dat_test <- dat[1:20,]
+
+
+# Apply extract_content function to all URLs in the dataset
+dat_test$content_info <- lapply(dat_test$urls, function(x) sapply(x, extract_content))
+
+# Combine the extracted content with the original post text
+dat_test$combined_text <- mapply(function(text, content_info) {
+    paste(message, content_info$title, content_info$description, content_info$content, sep = " ")
+}, dat_test$t, dat_test$content_info)
+
+# Combine the extracted content with the original post text
+# Combine the extracted content with the original post text
+posts$combined_text <- mapply(function(text, content) {
+    paste(text, content$title, content$description, content$content, sep = " ")
+}, posts$text, posts$content_info)
+
+
+```
+
+# Descriptives
+```{r}
+
+```
+
