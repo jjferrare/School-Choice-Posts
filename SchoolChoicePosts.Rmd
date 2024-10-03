@@ -12,7 +12,6 @@ knitr::opts_chunk$set(echo = TRUE)
 # Overview and Objectives
 
 # Setup
-
 ## Libraries
 ```{r}
 library(tidyverse)
@@ -24,7 +23,16 @@ library(tidytext)
 library(topicmodels)
 library(lubridate)
 library(reshape2)
+library(reticulate)
+library(Rtsne)
+library(wordcloud)
+library(RColorBrewer)
+library(cluster)
+library(factoextra)
+library(dendextend)
+library(parallel)
 ```
+
 ## Data
 ```{r}
 # raw dataset retrieved via CrowdTangle on August 13, 2024 using historical search feature
@@ -66,7 +74,11 @@ dat$year <- format(dat$Post_Created_Date, "%Y")
 
 # only use posts from 2019 thru 2021
 dat <- dat %>% filter(year %in% c("2019", "2020", "2021"))
+```
 
+# LDA Topic Modeling
+## Preprocessing
+```{r}
 # Tokenize and clean the text data
 dat_clean <- dat %>%
   unnest_tokens(word, Message) %>%
@@ -74,7 +86,7 @@ dat_clean <- dat %>%
   filter(!word %in% c("#schoolchoice", "schoolchoice", "school", "http", "https"))  # Remove irrelevant tokens
 ```
 
-# Document-Term Matrix
+## Document-Term Matrix
 ```{r}
 # Create a list of DTMs, one for each year 
 dtms <- list()
@@ -92,10 +104,10 @@ for (year in unique(dat_clean$year)) {
 
 ```
 
-# Topic Modeling
+## Topic Model
 ```{r}
 # Set the number of topics
-k <- 6  # You can adjust the number of topics
+k <- 6  # this can be adjusted (use elbow plot for guidance)
 
 # Store models for each time slice
 models <- list()
@@ -108,7 +120,7 @@ for (year in names(dtms)) {
 
 ```
 
-# Analysis of Topics over Time
+## Analysis of Topics over Time
 ```{r}
 # Extract the top terms for each topic in each year
 top_terms <- list()
@@ -124,7 +136,7 @@ for (year in names(models)) {
 }
 
 # Example: Compare top terms for a specific topic across years
-topic_to_track <- 1  # Replace with the topic number you're interested in
+topic_to_track <- 1  # Replace with the topic number of interest
 
 for (year in names(top_terms)) {
   cat("Top terms in year", year, "for topic", topic_to_track, ":\n")
@@ -134,9 +146,9 @@ for (year in names(top_terms)) {
 
 ```
 
-# Perplexity
+## Perplexity
 ```{r}
-# Define the range of topics you want to test
+# Define the range of topics to test
 topic_range <- seq(2, 10, by = 2)  
 
 # Initialize a vector to store perplexity values
@@ -168,8 +180,7 @@ ggplot(perplexity_df, aes(x = Topics, y = Perplexity)) +
 
 ```
 
-
-# Visualization
+## Visualization
 ```{r}
 # Extract gamma (topic proportions) for each year
 gamma_values <- lapply(models, function(model) {
@@ -189,14 +200,172 @@ ggplot(gamma_df, aes(x = as.integer(year), y = gamma, color = factor(topic))) +
 
 ```
 
+# BERT-based Clustering
+## Preprocessing
+Note that if you already ran the pre-processing steps for LDA then a lot of this will already be done. However, I prefer to just start with the original data set and do the pre-processing steps again to ensure that the data is clean and consistent for this particular analysis.
+
+```{r}
+# Clean the Message column
+dat_clean <- dat %>%
+  mutate(Message_clean = Message %>%
+           tolower() %>%                                    # Convert to lowercase
+           str_replace_all("http[s]?://\\S+|www\\.\\S+", "") %>%  # Remove URLs
+           str_replace_all("[[:punct:]]", "") %>%           # Remove punctuation
+           str_replace_all("[[:digit:]]", "") %>%           # Remove numbers
+           removeWords(stopwords("en")) %>%                 # Remove English stop words
+           str_squish()                                     # Remove extra whitespaces
+  )
+                                   
+```
+
+## Tokenization and Embedding
+```{r}
+# Set up Python environment for this step
+# system("pip install -U transformers sentence-transformers")
+
+# Load pre-trained model
+transformers <- import("transformers")
+sentence_transformers <- import("sentence_transformers")
+
+# Instantiate the model
+model <- sentence_transformers$SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+# Generate embeddings for all cleaned posts
+embeddings <- model$encode(dat_clean$Message_clean)
+
+# Convert embeddings to a data frame 
+embedding_df <- as.data.frame(embeddings)
+
+tekenizers_parallelism=FALSE
+
+```
+
+## K-Means Clustering
+### Elbow Method
+```{r}
+# Distribute the k-means calculations across multiple cores to speed up the process
+# Detect the number of cores
+num_cores <- detectCores() - 1
+
+# Run k-means in parallel (for multiple cores)
+wcss <- mclapply(1:20, function(k) {
+  kmeans_result <- kmeans(embedding_df_unique, centers = k, nstart = 10, iter.max = 100)
+  kmeans_result$tot.withinss
+}, mc.cores = num_cores)
+
+# Convert result to numeric vector
+wcss <- unlist(wcss)
+
+# Plot the elbow plot
+plot(1:20, wcss, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters",
+     ylab = "Total Within-Cluster Sum of Squares (WCSS)",
+     main = "Elbow Plot for K-Means Clustering (Parallelized)")
+
+
+```
+Based on the results, the elbow plot suggests 4 or 5 clusters, but it's not as clear as we would like. I started with 4 but we will adjust later.
+```{r}
+set.seed(123)
+
+# Set the number of clusters you want
+num_clusters <- 4
+
+# Perform K-means clustering
+kmeans_model <- kmeans(embedding_df_unique, centers = num_clusters, nstart = 25)
+
+# Add the cluster assignments back to your original data
+dat_clean <- dat_clean %>%
+  mutate(cluster = kmeans_model$cluster)
+
+# frequency count of clusters
+table(dat_clean$cluster)
+
+# plot of cluster frequency by year
+ggplot(dat_clean, aes(x = year, fill = factor(cluster))) +
+  geom_bar(position = "dodge") +
+  labs(title = "Cluster Frequency by Year", x = "Year", y = "Frequency") +
+  theme_minimal()
+
+# print the message of the first 5 posts in each cluster
+for (cluster_id in unique(dat_clean$cluster)) {
+  cat("Cluster", cluster_id, ":\n")
+  print(dat_clean %>% filter(cluster == cluster_id) %>% slice_head(n = 5) %>% select(Message))
+  cat("\n")
+}
+
+```
+
+## Visualization
+```{r}
+# View top posts for each cluster
+top_posts_per_cluster <- dat_clean %>%
+  group_by(cluster) %>%
+  arrange(desc(Overperforming_Score)) %>%  # Adjust by different metrics
+  slice_head(n = 5)  # Get the top 5 posts per cluster
+
+# Print the top posts
+print(top_posts_per_cluster)
+
+# Create a word cloud for each cluster
+for (cluster_id in unique(dat_clean$cluster)) {
+  cluster_posts <- dat_clean %>% filter(cluster == cluster_id)
+  text <- paste(cluster_posts$Message_clean, collapse = " ")
+  
+  # Create a word cloud
+  wordcloud(text, max.words = 100, random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+}
+
+# Note that one of the clusters is blank, likely due to the posts having previously contained urls.
+
+
+```
+
+## hierarchical clustering
+This was just exploratory. I do not anticipate using this in the final analysis. Ignore this chunk for now.
+```{r}
+
+# Compute the distance matrix using Euclidean distance
+dist_matrix <- dist(embedding_df, method = "euclidean")
+
+# Perform hierarchical clustering 
+hc_model <- hclust(dist_matrix, method = "average")
+
+
+# Function to calculate total within-cluster sum of squares (WCSS) for a given number of clusters
+wcss <- function(k) {
+  clusters <- cutree(hc_model, k = k)
+  
+  # Calculate WCSS: within-cluster sum of squares
+  sum(sapply(unique(clusters), function(i) {
+    cluster_points <- embedding_df[clusters == i, ]
+    cluster_center <- colMeans(cluster_points)
+    sum(rowSums((cluster_points - cluster_center) ^ 2))
+  }))
+}
+
+# Create a vector to store WCSS for 1 to 20 clusters
+wcss_values <- sapply(1:20, wcss)
+
+# Plot the scree plot (elbow plot)
+plot(1:20, wcss_values, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters",
+     ylab = "Total Within-Cluster Sum of Squares (WCSS)",
+     main = "Elbow Plot for Hierarchical Clustering")
+
+
+
+```
 
 # Notes
-Some possible analyses to consider:
+Some possible exploratory analyses to consider once we finalize the topic clusters:
 1. Topic number by term MDS plot to see how topics are related to each other and to identify meta-topics
 2. create an actor/page name by topic matrix to see which actors/pages are associated with which topics
 3. create a topic by time matrix to see how topics change over time
 4. analyze url content for each topic and changes over time
+5. link clusters/topics to underlying ideology (e.g., is there a shift from neolib to authoritarian?)
 
+Below is some old code I was playing with to extract content from URLs. It did not work as intended, but I am keeping it here for reference as it may bs useful in the future.
 ```{r}
 # Run test of URL extraction and content extraction on a subset of the data
 # filter the first 20 cases in dat
